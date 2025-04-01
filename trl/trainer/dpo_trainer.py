@@ -123,11 +123,16 @@ class DataCollatorForPreference(DataCollatorMixin):
 
     pad_token_id: int
     return_tensors: str = "pt"
+    
+    def __init__(self, pad_token_id: int, processor=None, return_tensors: str = "pt"):
+        self.pad_token_id = pad_token_id
+        self.processor = processor
+        self.return_tensors = return_tensors
 
     def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
         # Convert to tensor
-        prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples]
-        prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids]
+        # prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples]
+        # prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids]
         chosen_input_ids = [torch.tensor(example["chosen_input_ids"]) for example in examples]
         chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
         rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
@@ -142,8 +147,8 @@ class DataCollatorForPreference(DataCollatorMixin):
 
         # Pad
         output = {}
-        output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
-        output["prompt_attention_mask"] = pad(prompt_attention_mask, padding_value=0, padding_side="left")
+        # output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
+        # output["prompt_attention_mask"] = pad(prompt_attention_mask, padding_value=0, padding_side="left")
         output["chosen_input_ids"] = pad(chosen_input_ids, padding_value=self.pad_token_id)
         output["chosen_attention_mask"] = pad(chosen_attention_mask, padding_value=0)
         output["rejected_input_ids"] = pad(rejected_input_ids, padding_value=self.pad_token_id)
@@ -157,7 +162,30 @@ class DataCollatorForPreference(DataCollatorMixin):
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
+        if "image_grid_thw" in examples[0]:
+            output["image_grid_thw"] = torch.tensor(
+                [example["image_grid_thw"] for example in examples], dtype=torch.long
+                )
 
+        # Handle images using processor if they exist
+        if "images" in examples[0]:
+            # Extract images from examples
+            images = [example["images"] for example in examples]
+            text = [example["prompt"] for example in examples]
+            
+            # Process images using the processor
+            image_features = self.processor(text=text, images=images, return_tensors="pt", padding=True)
+        
+            # Add image features to output
+            for key, value in image_features.items():
+                if key.startswith("image_"):
+                    output[key] = value
+                # For pixel_values specifically 
+                elif key == "pixel_values":
+                    output["pixel_values"] = value
+            output['image_grid_thw'] = image_features['image_grid_thw']
+            output['prompt_input_ids'] = image_features['input_ids']
+            output['prompt_attention_mask'] = image_features['attention_mask']
         return output
 
 
@@ -378,7 +406,7 @@ class DPOTrainer(Trainer):
                 )
 
         if data_collator is None:
-            data_collator = DataCollatorForPreference(pad_token_id=self.padding_value)
+            data_collator = DataCollatorForPreference(pad_token_id=self.padding_value, processor=processing_class)
 
         # Disable dropout in the model and reference model
         if args.disable_dropout:
@@ -555,10 +583,11 @@ class DPOTrainer(Trainer):
             # Tokenize the dataset
             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
-
+            print("Calling process row")
+            map_kwargs['num_proc'] = 1
             dataset = dataset.map(
                 self.tokenize_row if not self.is_vision_model else self.process_row,
-                remove_columns=["prompt", "chosen", "rejected"],
+                remove_columns=["chosen", "rejected"],
                 fn_kwargs={
                     "processing_class": processing_class,
                     "max_prompt_length": args.max_prompt_length,
@@ -642,7 +671,7 @@ class DPOTrainer(Trainer):
         processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
 
         prompt_input_ids = processed_features["input_ids"][0]
-        pixel_values = processed_features["pixel_values"][0]
+        pixel_values = processed_features["pixel_values"] #[0]
         chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
         rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
 
@@ -665,6 +694,7 @@ class DPOTrainer(Trainer):
         output = {
             "prompt_input_ids": prompt_input_ids,
             "pixel_values": pixel_values,
+            "image_grid_thw": processed_features["image_grid_thw"][0],
             "chosen_input_ids": chosen_input_ids,
             "rejected_input_ids": rejected_input_ids,
         }
@@ -673,7 +703,6 @@ class DPOTrainer(Trainer):
             output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
         if "image_sizes" in processed_features:
             output["image_sizes"] = processed_features["image_sizes"][0]
-
         return output
 
     def _prepare_deepspeed(self, model: PreTrainedModelWrapper):
@@ -897,7 +926,8 @@ class DPOTrainer(Trainer):
             )
         if "image_sizes" in batch:
             output["image_sizes"] = torch.cat([batch["image_sizes"], batch["image_sizes"]], dim=0)
-
+        if "image_grid_thw" in batch:
+            output["image_grid_thw"] = torch.cat([batch["image_grid_thw"], batch["image_grid_thw"]], dim=0)
         # Concatenate the chosen and rejected completions
         max_completion_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
         output["completion_input_ids"] = torch.cat(
@@ -912,7 +942,6 @@ class DPOTrainer(Trainer):
                 pad_to_length(batch["rejected_attention_mask"], max_completion_length, pad_value=0),
             ),
         )
-
         return output
 
     def dpo_loss(
@@ -1108,7 +1137,7 @@ class DPOTrainer(Trainer):
         We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
         num_examples = batch["prompt_input_ids"].shape[0]
-
+        
         concatenated_batch = self.concatenated_inputs(batch, padding_value=self.padding_value)
 
         model_kwargs = {}
@@ -1122,6 +1151,8 @@ class DPOTrainer(Trainer):
             model_kwargs["pixel_attention_mask"] = concatenated_batch["pixel_attention_mask"]
         if "image_sizes" in concatenated_batch:
             model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
+        if "image_grid_thw" in concatenated_batch:
+            model_kwargs["image_grid_thw"] = concatenated_batch["image_grid_thw"]
 
         prompt_input_ids = concatenated_batch["prompt_input_ids"]
         prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
@@ -1188,7 +1219,6 @@ class DPOTrainer(Trainer):
                 model_kwargs["position_ids"] = position_ids
             else:
                 model_kwargs["attention_mask"] = attention_mask
-
             outputs = model(input_ids, **model_kwargs)
             logits = outputs.logits
 
